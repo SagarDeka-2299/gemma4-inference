@@ -1,0 +1,33 @@
+[project]
+name = "gemma4-inference"
+version = "0.1.0"
+description = "OpenAI-compatible inference server for a LoRA-fine-tuned gemma-4-e4b-it, with grammar-constrained (guided) JSON decoding and lightweight dynamic batching."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # unsloth 2026.7.x pins these ceilings itself; stated explicitly so a
+    # future unsloth release can't silently pull in an untested transformers.
+    "unsloth",
+    "unsloth_zoo",
+    "transformers>=4.51.3,<=5.5.0",
+    "trl>=0.18.2,<=0.24.0",
+    "peft>=0.18.0",
+    "bitsandbytes>=0.45.5,!=0.46.0,!=0.48.0",
+    "torch>=2.4.0,<2.12.0",
+    "torchvision",
+    "torchaudio",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2",
+    "lm-format-enforcer>=0.10",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
