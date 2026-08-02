@@ -1,65 +1,107 @@
 # gemma4-inference
 
-OpenAI-compatible inference server for a LoRA-fine-tuned `gemma-4-e4b-it`
-(AutoQA adapter), with real grammar-constrained JSON decoding and lightweight
-dynamic batching. Text-only — the vision/audio towers are stripped at load.
+OpenAI-compatible inference deployment for a LoRA-fine-tuned `gemma-4-e4b-it`
+(AutoQA adapter), served with **vLLM** — real grammar-constrained JSON decoding,
+real tool-calling, and continuous batching. Text-only — the vision/audio towers
+are dropped before serving.
 
-Runs on `transformers` + `unsloth` (not vLLM). vLLM's Gemma4 loader does not
-support this checkpoint's mixed 4-bit/dense layout (a deliberate per-layer
-quality skip-list), so this serves directly off the same stack that trained
-the adapter.
+Two model names, one resident base model:
 
-## Why not vLLM
+- `plain-gemma` — base model, no adapter
+- `autoqa-gemma` — base + LoRA, applied by vLLM's own adapter hot-swap (`--enable-lora`)
 
-The base checkpoint (`unsloth/gemma-4-e4b-it-unsloth-bnb-4bit`) is **mixed
-precision**: most linear layers are packed 4-bit on disk, but a specific
-skip-list of layers (e.g. `layers.1.mlp`) is kept dense bf16 by design, for
-quality. vLLM 0.26.0's Gemma4 loader allocates packed-shape parameters for
-every linear layer regardless of that skip-list, and crashes with a shape
-assertion the moment it hits a deliberately-dense layer. `transformers` +
-`unsloth` load this checkpoint correctly (it's the format they produced), so
-that's what this serves on.
+## Why dequantize before serving
+
+The trained checkpoint (`unsloth/gemma-4-e4b-it-unsloth-bnb-4bit`) is
+**mixed precision on disk**: most linear layers are packed 4-bit, but a
+deliberate skip-list of layers is kept dense bf16 for quality. vLLM's Gemma4
+loader doesn't respect that skip-list — it allocates packed-4bit shapes for
+every linear layer and crashes with a shape assertion the moment it hits a
+layer that's actually stored dense. This isn't specific to this checkpoint:
+it's a long-standing, still-open upstream issue affecting any of Unsloth's
+dynamic-quantized checkpoints served on vLLM
+([unslothai/unsloth#1886](https://github.com/unslothai/unsloth/issues/1886)).
+
+The fix: `dequantize_base.py` loads the base checkpoint once (respecting the
+real skip-list, via `transformers`' own `model.dequantize()`), and writes a
+uniformly dense bf16 checkpoint with no mixed-precision metadata at all. vLLM
+then loads that cleanly and applies its own **uniform** `bitsandbytes`
+quantization at serve time (`--quantization bitsandbytes`) — smaller memory
+footprint than dense bf16, more headroom for KV cache/concurrency, and no
+skip-list for the loader to misinterpret.
+
+The LoRA adapter is **not** folded into this step — it's applied separately by
+vLLM (`--enable-lora`), so `plain-gemma` and `autoqa-gemma` still come from one
+resident model instead of needing two copies in memory.
+
+`dequantize_base.py` also writes the checkpoint in ~2GB shards, moving one
+shard to host RAM at a time. The box this runs on has only 15GB host RAM —
+building the whole ~16GB dense state dict in a single Python dict at once
+silently OOM-kills the process (no traceback); sharding keeps peak host RAM
+usage low regardless of total model size.
 
 ## Setup
 
+Dequantize (one-time, run on the training/GPU box — needs a full 4-bit load of
+the base model plus enough VRAM headroom to hold the dense conversion):
+
 ```bash
 uv sync
+uv run python dequantize_base.py
+# writes /opt/ml/models/autoqa-base-dense (edit BASE_MODEL/OUT in the script to change)
 ```
 
-Requires an NVIDIA GPU with enough VRAM for a ~10 GB text-only 4-bit base
-(tested on a single L4, 24 GB). `torch`/`torchvision`/`torchaudio` are pulled
-from the PyTorch cu124 index (see `pyproject.toml`).
+Serving runs in a **separate** environment — vLLM pins its own `torch`/
+`transformers` versions that conflict with the ones `unsloth` needs for the
+dequantize step above, so this repo intentionally does not try to manage both
+in one `pyproject.toml`:
 
-Drop the trained adapter at `/opt/ml/adapters/standard/` (or edit
-`ADAPTER_DIR` in `serve_hf.py`) — `adapter_config.json` +
-`adapter_model.safetensors`, the standard PEFT adapter layout.
+```bash
+pip install vllm==0.26.0 xgrammar==0.2.3
+```
 
-The server also expects a bearer key at `/opt/ml/serve/api_key` (or edit
-`KEYFILE`) — a plain text file containing the token clients must send as
-`Authorization: Bearer <token>`.
+Drop the trained adapter at `/opt/ml/adapters/standard/` (standard PEFT
+adapter layout: `adapter_config.json` + `adapter_model.safetensors`).
+
+The server expects a bearer key at `/opt/ml/serve/api_key` — a plain text file
+containing the token clients must send as `Authorization: Bearer <token>`.
 
 ## Run
 
 ```bash
-uv run uvicorn serve_hf:app --host 0.0.0.0 --port 8000
+API_KEY=$(cat /opt/ml/serve/api_key)
+vllm serve /opt/ml/models/autoqa-base-dense \
+  --served-model-name plain-gemma \
+  --quantization bitsandbytes \
+  --enable-lora --lora-modules autoqa-gemma=/opt/ml/adapters/standard --max-lora-rank 16 \
+  --enable-auto-tool-choice --tool-call-parser functiongemma \
+  --structured-outputs-config '{"backend": "xgrammar"}' \
+  --max-model-len 8192 --dtype bfloat16 --gpu-memory-utilization 0.90 --enforce-eager \
+  --port 8000 --api-key "$API_KEY"
+```
+
+`--enforce-eager` trades away CUDA-graph capture for lower baseline memory
+usage — on a single L4 (24GB), the graph-capture memory reservation otherwise
+leaves too little room for KV cache at `--max-model-len 8192`.
+
+`deploy/autoqa-vllm.service` is the systemd unit used in production — enable
+it for auto-start on boot and auto-restart on failure:
+
+```bash
+sudo cp deploy/autoqa-vllm.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now autoqa-vllm.service
 ```
 
 ## API
 
-OpenAI-compatible `/v1/chat/completions` and `/v1/models`. Two model names:
-
-- `plain-gemma` — base model, adapter disabled (`model.disable_adapter()`)
-- `autoqa-gemma` — base + LoRA adapter
-
-Both share one resident 10 GB weight copy; only the adapter toggles.
+OpenAI-compatible `/v1/chat/completions` and `/v1/models`.
 
 ### Structured output / constrained decoding
 
 Same guarantee as OpenAI structured outputs: the sampler is masked at every
-generation step so only tokens that keep the output on a path to a
-schema-valid JSON document are allowed. Invalid JSON is not just unlikely —
-it's structurally impossible. Implemented with `lm-format-enforcer`
-(`structured.py`), not a prompt hint.
+generation step (via vLLM's `xgrammar` backend) so only tokens that keep the
+output on a path to a schema-valid JSON document are allowed.
 
 ```bash
 curl -s https://<host>:8000/v1/chat/completions \
@@ -79,46 +121,50 @@ curl -s https://<host>:8000/v1/chat/completions \
   }'
 ```
 
-`tools` + `tool_choice` (OpenAI function-calling shape) work the same way —
-`structured.schema_from_request()` extracts the target schema from either
-surface. **`tools` must be passed if the model was trained with them
-rendered into the prompt** — the chat template puts the tool schema in the
-system turn, and omitting it at inference puts the model off-distribution
-(it starts inventing key names instead of following the trained schema).
+### Tool calling
 
-### Dynamic batching
+Native OpenAI-style `tools` / `tool_choice` is also supported, via vLLM's
+Gemma-specific tool-call parser (`functiongemma`):
 
-Not continuous/paged-attention batching (that's what vLLM or Triton give
-you) — lightweight request coalescing. Requests arriving within a
-`BATCH_WINDOW_SECONDS` (0.5s) window are padded together and run through one
-`generate()` call, up to `MAX_BATCH_SIZE` (8) per batch. See `batching.py`.
+```bash
+curl -s https://<host>:8000/v1/chat/completions \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "autoqa-gemma",
+    "temperature": 0,
+    "messages": [{"role":"user","content":"Budget is 50000, decision by end of quarter."}],
+    "tools": [{"type":"function","function":{"name":"extract_deal","parameters":{"...":"..."}}}],
+    "tool_choice": {"type":"function","function":{"name":"extract_deal"}}
+  }'
+```
 
-Two correctness constraints this respects:
+**`tools` must be passed if the model was trained with them rendered into the
+prompt** — the chat template puts the tool schema in the system turn, and
+omitting it at inference puts the model off-distribution.
 
-1. `plain-gemma` and `autoqa-gemma` never share a physical batch — the LoRA
-   toggle is whole-model, not per-sequence. Requests are bucketed by
-   `(model, temperature)`; one shared lock still serializes actual GPU
-   execution across every bucket, since it's the same model object
-   underneath regardless of route.
-2. Different requests in the same batch can carry different JSON schemas —
-   `lm-format-enforcer`'s masking function takes a `batch_id`, so each row
-   gets its own grammar (`structured.batched_prefix_allowed_tokens_fn`).
+### Batching
+
+Real continuous batching (paged KV cache, iteration-level scheduling) via
+vLLM — not the time-windowed request-coalescing a hand-rolled server would
+need. Concurrent requests share GPU execution properly; a slow request
+doesn't block fast ones behind it in the same way a blocking `generate()` call
+would. Verified: 8 concurrent requests complete in ~16s total on a single L4.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `serve_hf.py` | FastAPI app: auth, request validation, OpenAI-shaped responses |
-| `batching.py` | Request queues, coalescing window, padded batched `generate()` |
-| `structured.py` | Grammar-constrained decoding via `lm-format-enforcer` |
+| `dequantize_base.py` | One-time step: mixed-precision base checkpoint → uniform dense bf16 |
+| `deploy/autoqa-vllm.service` | systemd unit for the live vLLM server (auto-start, auto-restart) |
 
 ## Known limitations
 
-- One GPU, one process — no horizontal scaling built in.
-- Batching is time-windowed, not continuous; a slow row in a batch holds up
-  the fast ones sharing that `generate()` call.
-- `completion_tokens` in the response `usage` can slightly overcount for
-  rows that finish early within a batch (trailing pad tokens included in the
-  count) — the returned completion *text* is always correct
-  (`skip_special_tokens=True` strips them), only the token-count stat is a
-  minor approximation.
+- Single GPU, single vLLM process — no horizontal scaling built in.
+- `--enforce-eager` disables CUDA graphs to leave headroom for KV cache on a
+  24GB card; a larger GPU could drop this flag for faster per-step decode.
+- The dequantized checkpoint is larger on disk (~16GB dense bf16, sharded)
+  than the original mixed-precision checkpoint (~10GB) — this is the tradeoff
+  for sidestepping the vLLM loader bug; vLLM's own `--quantization
+  bitsandbytes` flag re-quantizes it uniformly at load time, so resident GPU
+  memory ends up smaller than the on-disk dense checkpoint, not larger.
