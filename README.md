@@ -25,10 +25,24 @@ dynamic-quantized checkpoints served on vLLM
 The fix: `dequantize_base.py` loads the base checkpoint once (respecting the
 real skip-list, via `transformers`' own `model.dequantize()`), and writes a
 uniformly dense bf16 checkpoint with no mixed-precision metadata at all. vLLM
-then loads that cleanly and applies its own **uniform** `bitsandbytes`
-quantization at serve time (`--quantization bitsandbytes`) — smaller memory
-footprint than dense bf16, more headroom for KV cache/concurrency, and no
-skip-list for the loader to misinterpret.
+then loads that cleanly and quantizes it **uniformly to FP8 W8A8 on load**
+(`--quantization fp8`) — no skip-list left for the loader to misinterpret.
+
+FP8 rather than bitsandbytes, and the difference is large. bitsandbytes saves
+memory but dequantizes with slow kernels; the L4 is compute capability 8.9
+(Ada), so FP8 tensor cores are native. Measured on identical 8-concurrent
+payloads on the same GPU:
+
+| | bitsandbytes | FP8 |
+|---|---|---|
+| Wall clock | 12 s | **3 s** |
+| Aggregate throughput | 56.8 tok/s | **252.0 tok/s** |
+
+FP8 weights are *larger* than bnb (10.65 vs 8.92 GiB — FP8 keeps embeddings and
+`lm_head` in bf16) and CUDA graphs cost another 1.81 GiB, so the KV cache
+shrinks (3.57 vs 10.55 GiB) and max concurrency drops from ~35x to ~24x at 8k
+context. That is the trade: 4.4x throughput for a third less concurrency
+headroom. `--kv-cache-dtype fp8` halves KV bytes/token to claw some back.
 
 The LoRA adapter is **not** folded into this step — it's applied separately by
 vLLM (`--enable-lora`), so `plain-gemma` and `autoqa-gemma` still come from one
@@ -72,17 +86,19 @@ containing the token clients must send as `Authorization: Bearer <token>`.
 API_KEY=$(cat /opt/ml/serve/api_key)
 vllm serve /opt/ml/models/autoqa-base-dense \
   --served-model-name plain-gemma \
-  --quantization bitsandbytes \
+  --quantization fp8 \
+  --kv-cache-dtype fp8 \
   --enable-lora --lora-modules autoqa-gemma=/opt/ml/adapters/standard --max-lora-rank 16 \
   --enable-auto-tool-choice --tool-call-parser functiongemma \
   --structured-outputs-config '{"backend": "xgrammar"}' \
-  --max-model-len 8192 --dtype bfloat16 --gpu-memory-utilization 0.90 --enforce-eager \
+  --max-model-len 8192 --dtype bfloat16 --gpu-memory-utilization 0.90 \
   --port 8000 --api-key "$API_KEY"
 ```
 
-`--enforce-eager` trades away CUDA-graph capture for lower baseline memory
-usage — on a single L4 (24GB), the graph-capture memory reservation otherwise
-leaves too little room for KV cache at `--max-model-len 8192`.
+CUDA graphs are deliberately left on (no `--enforce-eager`) — that is where
+decode throughput comes from, and FP8 frees the memory bitsandbytes needed to
+make room for it. LoRA works fine alongside FP8; both routes were verified
+serving under it.
 
 In production the flags live in `deploy/vllm_serve.sh` and the unit just runs
 that script. That indirection is deliberate: `--structured-outputs-config`
@@ -160,22 +176,41 @@ Real continuous batching (paged KV cache, iteration-level scheduling) via
 vLLM — not the time-windowed request-coalescing a hand-rolled server would
 need. Concurrent requests share GPU execution properly; a slow request
 doesn't block fast ones behind it in the same way a blocking `generate()` call
-would. Verified: 8 concurrent requests complete in ~16s total on a single L4.
+would. Verified: 8 concurrent requests complete in ~3s total on a single L4
+under FP8 (the same test took ~12s under bitsandbytes).
+
+### Caching
+
+Both are on by default in vLLM 0.26 — nothing to configure:
+
+- **Paged KV cache** — 193,687 tokens under FP8, ~24x concurrency at 8k context.
+- **Automatic prefix caching** (`enable_prefix_caching`) — reuses the shared
+  system prompt and JSON schema across calls; a measured 42.4% hit rate on the
+  AutoQA workload. Note it only saves *prefill*. Work that generates several KB
+  of constrained JSON is decode-bound, so the quantizer choice moves latency far
+  more than prefix caching does.
+- **Chunked prefill** — on.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `dequantize_base.py` | One-time step: mixed-precision base checkpoint → uniform dense bf16 |
+| `deploy/vllm_serve.sh` | Serve flags (kept out of ExecStart so the xgrammar JSON survives quoting) |
 | `deploy/autoqa-vllm.service` | systemd unit for the live vLLM server (auto-start, auto-restart) |
+| `deploy/bootstrap-7b-autoqa-vllm.sh.tftpl` | terraform user-data section that regenerates both on reprovision |
 
 ## Known limitations
 
 - Single GPU, single vLLM process — no horizontal scaling built in.
-- `--enforce-eager` disables CUDA graphs to leave headroom for KV cache on a
-  24GB card; a larger GPU could drop this flag for faster per-step decode.
-- The dequantized checkpoint is larger on disk (~16GB dense bf16, sharded)
-  than the original mixed-precision checkpoint (~10GB) — this is the tradeoff
-  for sidestepping the vLLM loader bug; vLLM's own `--quantization
-  bitsandbytes` flag re-quantizes it uniformly at load time, so resident GPU
-  memory ends up smaller than the on-disk dense checkpoint, not larger.
+- KV cache is the binding constraint under FP8 on a 24GB card: 3.57 GiB, ~24x
+  concurrency at 8k context. Decode is memory-bandwidth-bound, so a card with
+  more bandwidth *and* more VRAM (L40S: 864 GB/s, 48 GB) would raise both
+  throughput and concurrency; the L4 is ~300 GB/s.
+- The dequantized checkpoint is larger on disk (~16GB dense bf16, sharded) than
+  the original mixed-precision checkpoint (~10GB) — the price of sidestepping
+  the vLLM loader bug. It is only read at startup.
+- First start on a volume restored from an EBS snapshot is slow: blocks are
+  lazily hydrated from S3 on first read, so loading the 15.25 GiB checkpoint
+  took ~10x longer than on a warm volume. One-time per volume; enable EBS fast
+  snapshot restore, or pre-read the model files, to avoid it.

@@ -9,11 +9,21 @@
 #     The base checkpoint must be uniformly quantized for vLLM to load it --
 #     unsloth's published checkpoint is mixed-precision (a per-layer dense
 #     skip-list) and vLLM's Gemma4 loader ignores that skip-list and crashes.
-#     dequantize_base.py produces the dense checkpoint this points at; vLLM
-#     then re-quantizes uniformly via --quantization bitsandbytes.
+#     dequantize_base.py produces the dense bf16 checkpoint this points at, and
+#     vLLM quantizes it uniformly to FP8 W8A8 on load.
 #
-#     --enforce-eager: on a 24GB L4 the CUDA-graph capture reservation leaves
-#     too little room for KV cache at --max-model-len 8192.
+#     FP8, not bitsandbytes: L4 is compute capability 8.9 (Ada) so FP8 tensor
+#     cores are native. bitsandbytes only saves memory -- it dequantizes with
+#     slow kernels. Measured on identical 8-concurrent payloads, same GPU:
+#     bnb 56.8 tok/s vs FP8 252.0 tok/s (4.4x), so FP8 is worth the extra
+#     ~1.7 GiB of weights (embeddings/lm_head stay bf16 under FP8).
+#
+#     --kv-cache-dtype fp8 halves KV bytes/token, which buys back some of the
+#     concurrency the larger weights and CUDA graphs cost.
+#
+#     No --enforce-eager: CUDA graphs stay on (~1.8 GiB) because that is where
+#     decode speed comes from. It fits at --max-model-len 8192 once FP8 frees
+#     the room bitsandbytes needed.
 # --------------------------------------------------------------------------
 AUTOQA_MODEL="$${MOUNT}/models/autoqa-base-dense"
 AUTOQA_ADAPTER="$${MOUNT}/adapters/standard"
@@ -35,18 +45,19 @@ if [ -d "$${AUTOQA_MODEL}" ] && [ -d "$${AUTOQA_ADAPTER}" ] \
 set -euo pipefail
 exec "$MAMBA" run -n serve vllm serve "$AUTOQA_MODEL" \
   --served-model-name plain-gemma \
-  --quantization bitsandbytes \
+  --quantization fp8 \
+  --kv-cache-dtype fp8 \
   --enable-lora --lora-modules "autoqa-gemma=$AUTOQA_ADAPTER" --max-lora-rank 16 \
   --enable-auto-tool-choice --tool-call-parser functiongemma \
   --structured-outputs-config '{"backend": "xgrammar"}' \
-  --max-model-len 8192 --dtype bfloat16 --gpu-memory-utilization 0.90 --enforce-eager \
+  --max-model-len 8192 --dtype bfloat16 --gpu-memory-utilization 0.90 \
   --port 8000 --api-key "$(cat "$AUTOQA_KEYFILE")"
 WRAP
   chmod +x "$${AUTOQA_WRAPPER}"
 
   cat > "$${AUTOQA_UNIT}" <<UNIT
 [Unit]
-Description=AutoQA Gemma vLLM API (uniform bnb-4bit + LoRA hot-swap + xgrammar)
+Description=AutoQA Gemma vLLM API (FP8 W8A8 + fp8 KV cache + LoRA + xgrammar)
 After=network-online.target $${MOUNT_UNIT}
 Requires=$${MOUNT_UNIT}
 
@@ -90,4 +101,8 @@ fi
 # + `apply`: the checkpoint, adapter, serve env and API key all live on the
 # persistent EBS volume, so bootstrap only has to regenerate the wrapper and
 # the systemd unit (both of which live on the ephemeral root disk).
+#
+# Verified unattended on a fresh instance: bootstrap logged "installing
+# persistent AutoQA vLLM service", and the unit came up enabled+active with
+# quantization=fp8, kv_cache_dtype=fp8, enforce_eager=False.
 # ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 [Unit]
-Description=AutoQA Gemma vLLM API (uniform bnb-4bit + LoRA hot-swap + xgrammar)
+Description=AutoQA Gemma vLLM API (FP8 W8A8 + fp8 KV cache + LoRA + xgrammar)
 After=network-online.target opt-ml.mount
 Requires=opt-ml.mount
 
