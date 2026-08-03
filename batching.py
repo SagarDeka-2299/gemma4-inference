@@ -130,10 +130,16 @@ async def run_batch(model, tokenizer, plain_model_name: str, lora_model_name: st
     else:
         kwargs["do_sample"] = False
 
+    # A malformed schema (e.g. a source doc corrupted with a literal
+    # "[Circular]" string) must fail only the request that asked for it, not
+    # every other request that happened to share this batch window. Rows with
+    # a compile error still run (unconstrained) so the batch tensor shape is
+    # unaffected; their future gets the real error below instead of a result.
+    schema_errors: dict[int, Exception] = {}
     schemas = [b.schema for b in batch]
     if any(s is not None for s in schemas):
-        kwargs["prefix_allowed_tokens_fn"] = structured.batched_prefix_allowed_tokens_fn(
-            tokenizer, schemas)
+        pfn, schema_errors = structured.batched_prefix_allowed_tokens_fn(tokenizer, schemas)
+        kwargs["prefix_allowed_tokens_fn"] = pfn
 
     adapter_mode = nullcontext() if model_name == lora_model_name else model.disable_adapter()
     with adapter_mode, torch.inference_mode():
@@ -141,14 +147,18 @@ async def run_batch(model, tokenizer, plain_model_name: str, lora_model_name: st
 
     padded_prompt_len = max_len
     for i, item in enumerate(batch):
+        if item.future.done():
+            continue
+        if i in schema_errors:
+            item.future.set_exception(schema_errors[i])
+            continue
         completion_ids = output[i, padded_prompt_len:]
         text = tok.decode(completion_ids, skip_special_tokens=True)
-        if not item.future.done():
-            item.future.set_result({
-                "text": text,
-                # Real (unpadded) prompt length -- left-padding added fake
-                # tokens that aren't part of this item's actual prompt.
-                "prompt_tokens": len(item.input_ids),
-                "completion_tokens": int(completion_ids.shape[0]),
-            })
+        item.future.set_result({
+            "text": text,
+            # Real (unpadded) prompt length -- left-padding added fake
+            # tokens that aren't part of this item's actual prompt.
+            "prompt_tokens": len(item.input_ids),
+            "completion_tokens": int(completion_ids.shape[0]),
+        })
 	

@@ -98,6 +98,19 @@ def batched_prefix_allowed_tokens_fn(tokenizer, schemas: list[dict[str, Any] | N
     to the enforcer: it only requires each call's token sequence to be the
     previous call's plus exactly one new token, regardless of what the
     prefix contains.
+
+    A malformed schema (e.g. a broken source doc with a literal "[Circular]"
+    string where a nested object belongs) must not take the whole batch down
+    with it -- a batch mixes independent requests, and one bad schema is not
+    grounds to fail requests that share a batch window purely by timing.
+    Compile failures are caught per row and returned in `errors`; that row
+    falls back to unconstrained generation (so it still occupies its slot in
+    the padded tensor) and the caller is expected to fail *that* row's future
+    with the captured error rather than return its generated text as if nothing
+    was wrong.
+
+    Returns (fn, errors) where errors: dict[int, Exception] covers only the
+    rows whose schema failed to compile.
     """
     global _FULL_VOCAB
     inner = _inner(tokenizer)
@@ -105,9 +118,13 @@ def batched_prefix_allowed_tokens_fn(tokenizer, schemas: list[dict[str, Any] | N
         _FULL_VOCAB = list(range(len(inner)))
 
     enforcers: dict[int, TokenEnforcer] = {}
+    errors: dict[int, Exception] = {}
     for i, schema in enumerate(schemas):
         if schema is not None:
-            enforcers[i] = TokenEnforcer(tokenizer_data(inner), JsonSchemaParser(schema))
+            try:
+                enforcers[i] = TokenEnforcer(tokenizer_data(inner), JsonSchemaParser(schema))
+            except Exception as exc:  # noqa: BLE001 -- isolate to this row only
+                errors[i] = exc
 
     def fn(batch_id: int, sent) -> List[int]:
         enforcer = enforcers.get(batch_id)
@@ -116,7 +133,7 @@ def batched_prefix_allowed_tokens_fn(tokenizer, schemas: list[dict[str, Any] | N
         res = enforcer.get_allowed_tokens(sent.tolist())
         return getattr(res, "allowed_tokens", res)
 
-    return fn
+    return fn, errors
 
 
 def schema_from_request(response_format: dict | None, tools: list | None,
