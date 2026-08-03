@@ -1,0 +1,93 @@
+# 7b. AutoQA API, served by vLLM. The dequantized base checkpoint, the LoRA
+#     adapter, the serve env and the API key all live on the persistent data
+#     disk; only this systemd unit lives on the instance root disk and so has
+#     to be recreated after every reprovision.
+#
+#     vLLM applies the adapter itself (--enable-lora), so one resident model
+#     serves both routes: plain-gemma (base) and autoqa-gemma (base+LoRA).
+#
+#     The base checkpoint must be uniformly quantized for vLLM to load it --
+#     unsloth's published checkpoint is mixed-precision (a per-layer dense
+#     skip-list) and vLLM's Gemma4 loader ignores that skip-list and crashes.
+#     dequantize_base.py produces the dense checkpoint this points at; vLLM
+#     then re-quantizes uniformly via --quantization bitsandbytes.
+#
+#     --enforce-eager: on a 24GB L4 the CUDA-graph capture reservation leaves
+#     too little room for KV cache at --max-model-len 8192.
+# --------------------------------------------------------------------------
+AUTOQA_MODEL="$${MOUNT}/models/autoqa-base-dense"
+AUTOQA_ADAPTER="$${MOUNT}/adapters/standard"
+AUTOQA_KEYFILE="$${MOUNT}/serve/api_key"
+AUTOQA_UNIT="/etc/systemd/system/autoqa-vllm.service"
+if [ -d "$${AUTOQA_MODEL}" ] && [ -d "$${AUTOQA_ADAPTER}" ] \
+   && [ -f "$${AUTOQA_KEYFILE}" ] && [ -d "$${MAMBA_ROOT_PREFIX}/envs/serve" ]; then
+  echo "installing persistent AutoQA vLLM service"
+
+  # The serve command lives in a wrapper script, not inline in ExecStart. The
+  # xgrammar flag takes a JSON value, and getting {"backend": "xgrammar"}
+  # intact through heredoc expansion *and* systemd's own quote parsing needs
+  # several layers of escaping that silently collapse to {backend: xgrammar}.
+  # A quoted heredoc ('WRAP') expands nothing, so the script is written
+  # literally; paths arrive as environment variables from the unit instead.
+  AUTOQA_WRAPPER="$${MOUNT}/serve/vllm_serve.sh"
+  cat > "$${AUTOQA_WRAPPER}" <<'WRAP'
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$MAMBA" run -n serve vllm serve "$AUTOQA_MODEL" \
+  --served-model-name plain-gemma \
+  --quantization bitsandbytes \
+  --enable-lora --lora-modules "autoqa-gemma=$AUTOQA_ADAPTER" --max-lora-rank 16 \
+  --enable-auto-tool-choice --tool-call-parser functiongemma \
+  --structured-outputs-config '{"backend": "xgrammar"}' \
+  --max-model-len 8192 --dtype bfloat16 --gpu-memory-utilization 0.90 --enforce-eager \
+  --port 8000 --api-key "$(cat "$AUTOQA_KEYFILE")"
+WRAP
+  chmod +x "$${AUTOQA_WRAPPER}"
+
+  cat > "$${AUTOQA_UNIT}" <<UNIT
+[Unit]
+Description=AutoQA Gemma vLLM API (uniform bnb-4bit + LoRA hot-swap + xgrammar)
+After=network-online.target $${MOUNT_UNIT}
+Requires=$${MOUNT_UNIT}
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$${MOUNT}
+Environment=MAMBA_ROOT_PREFIX=$${MAMBA_ROOT_PREFIX}
+Environment=HF_HOME=$${MOUNT}/hf-cache
+Environment=TMPDIR=$${MOUNT}/tmp
+Environment=LD_LIBRARY_PATH=$${MAMBA_ROOT_PREFIX}/envs/serve/lib
+Environment=MAMBA=$${MAMBA}
+Environment=AUTOQA_MODEL=$${AUTOQA_MODEL}
+Environment=AUTOQA_ADAPTER=$${AUTOQA_ADAPTER}
+Environment=AUTOQA_KEYFILE=$${AUTOQA_KEYFILE}
+ExecStart=/bin/bash $${AUTOQA_WRAPPER}
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=infinity
+LimitNOFILE=65536
+StandardOutput=append:$${MOUNT}/logs/autoqa-vllm.log
+StandardError=append:$${MOUNT}/logs/autoqa-vllm.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now autoqa-vllm.service
+else
+  echo "AutoQA vLLM prerequisites missing on $${MOUNT}; skipping autoqa-vllm.service"
+fi
+
+# ---------------------------------------------------------------------------
+# NOTE: this is an excerpt of terraform/compute/templates/bootstrap.sh.tftpl
+# (section 7b), kept here because the terraform tree lives outside any git
+# repo. It is a terraform templatefile: $${VAR} escapes to a literal ${VAR}
+# for the generated shell script, and ${mount_point} / ${env_name} are
+# interpolated by terraform at render time.
+#
+# This is what makes the server come back by itself after `terraform destroy`
+# + `apply`: the checkpoint, adapter, serve env and API key all live on the
+# persistent EBS volume, so bootstrap only has to regenerate the wrapper and
+# the systemd unit (both of which live on the ephemeral root disk).
+# ---------------------------------------------------------------------------

@@ -84,14 +84,25 @@ vllm serve /opt/ml/models/autoqa-base-dense \
 usage — on a single L4 (24GB), the graph-capture memory reservation otherwise
 leaves too little room for KV cache at `--max-model-len 8192`.
 
-`deploy/autoqa-vllm.service` is the systemd unit used in production — enable
-it for auto-start on boot and auto-restart on failure:
+In production the flags live in `deploy/vllm_serve.sh` and the unit just runs
+that script. That indirection is deliberate: `--structured-outputs-config`
+takes a JSON value, and getting `{"backend": "xgrammar"}` intact through both
+shell heredoc expansion *and* systemd's own quote parsing requires escaping
+that silently collapses to `{backend: xgrammar}`, which then fails pydantic
+validation at startup. Keeping the flags in a plain script avoids the problem;
+paths reach it as environment variables from the unit.
 
 ```bash
+sudo cp deploy/vllm_serve.sh /opt/ml/serve/ && sudo chmod +x /opt/ml/serve/vllm_serve.sh
 sudo cp deploy/autoqa-vllm.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now autoqa-vllm.service
 ```
+
+`deploy/bootstrap-7b-autoqa-vllm.sh.tftpl` is the terraform user-data section
+that regenerates both files on every reprovision, so the server comes back on
+its own after `terraform destroy` + `apply` — the model, adapter, serve env and
+API key persist on the EBS volume; only the wrapper and unit need recreating.
 
 ## API
 

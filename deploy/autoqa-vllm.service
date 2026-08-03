@@ -11,16 +11,12 @@ Environment=MAMBA_ROOT_PREFIX=/opt/ml/micromamba
 Environment=HF_HOME=/opt/ml/hf-cache
 Environment=TMPDIR=/opt/ml/tmp
 Environment=LD_LIBRARY_PATH=/opt/ml/micromamba/envs/serve/lib
-ExecStart=/bin/bash -c '\
-  API_KEY=$(cat /opt/ml/serve/api_key) && \
-  exec /opt/ml/bin/micromamba run -n serve vllm serve /opt/ml/models/autoqa-base-dense \
-    --served-model-name plain-gemma \
-    --quantization bitsandbytes \
-    --enable-lora --lora-modules autoqa-gemma=/opt/ml/adapters/standard --max-lora-rank 16 \
-    --enable-auto-tool-choice --tool-call-parser functiongemma \
-    --structured-outputs-config "{\"backend\": \"xgrammar\"}" \
-    --max-model-len 8192 --dtype bfloat16 --gpu-memory-utilization 0.90 --enforce-eager \
-    --port 8000 --api-key "$API_KEY"'
+Environment=MAMBA=/opt/ml/bin/micromamba
+Environment=AUTOQA_MODEL=/opt/ml/models/autoqa-base-dense
+Environment=AUTOQA_ADAPTER=/opt/ml/adapters/standard
+Environment=AUTOQA_KEYFILE=/opt/ml/serve/api_key
+# Flags live in the wrapper, not inline here -- see the comment in vllm_serve.sh.
+ExecStart=/bin/bash /opt/ml/serve/vllm_serve.sh
 Restart=on-failure
 RestartSec=15
 TimeoutStartSec=infinity
