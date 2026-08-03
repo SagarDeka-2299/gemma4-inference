@@ -22,7 +22,7 @@
 #     concurrency the larger weights and CUDA graphs cost.
 #
 #     No --enforce-eager: CUDA graphs stay on (~1.8 GiB) because that is where
-#     decode speed comes from. It fits at --max-model-len 8192 once FP8 frees
+#     decode speed comes from. It fits at --max-model-len 131072 once FP8 frees
 #     the room bitsandbytes needed.
 # --------------------------------------------------------------------------
 AUTOQA_MODEL="$${MOUNT}/models/autoqa-base-dense"
@@ -50,7 +50,7 @@ exec "$MAMBA" run -n serve vllm serve "$AUTOQA_MODEL" \
   --enable-lora --lora-modules "autoqa-gemma=$AUTOQA_ADAPTER" --max-lora-rank 16 \
   --enable-auto-tool-choice --tool-call-parser functiongemma \
   --structured-outputs-config '{"backend": "xgrammar"}' \
-  --max-model-len 8192 --dtype bfloat16 --gpu-memory-utilization 0.90 \
+  --max-model-len 131072 --dtype bfloat16 --gpu-memory-utilization 0.90 \
   --port 8000 --api-key "$(cat "$AUTOQA_KEYFILE")"
 WRAP
   chmod +x "$${AUTOQA_WRAPPER}"

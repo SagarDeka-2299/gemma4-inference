@@ -16,8 +16,13 @@
 # which is where decode speed comes from. --kv-cache-dtype fp8 halves KV
 # bytes/token and buys back some of the concurrency those two cost.
 #
-# Nothing is capped: full 8192 context, no max-token limit, and structured output
-# plus function calling are unchanged.
+# Nothing is capped: --max-model-len is the base model's full
+# max_position_embeddings (131072), there is no max-token limit, and structured
+# output plus function calling are unchanged. 8192 was tried first (the value the
+# adapter was trained at) and truncated real QA responses mid-JSON -- prompt plus
+# a 24-sub-parameter constrained-JSON completion exceeded it, and the client got
+# a SyntaxError instead of a score. Raising it did not cost KV cache; vLLM's
+# memory profile came out slightly better (429,904 tokens vs 193,687).
 #
 # Expects, from the unit: MAMBA, AUTOQA_MODEL, AUTOQA_ADAPTER, AUTOQA_KEYFILE.
 set -euo pipefail
@@ -28,5 +33,5 @@ exec "$MAMBA" run -n serve vllm serve "$AUTOQA_MODEL" \
   --enable-lora --lora-modules "autoqa-gemma=$AUTOQA_ADAPTER" --max-lora-rank 16 \
   --enable-auto-tool-choice --tool-call-parser functiongemma \
   --structured-outputs-config '{"backend": "xgrammar"}' \
-  --max-model-len 8192 --dtype bfloat16 --gpu-memory-utilization 0.90 \
+  --max-model-len 131072 --dtype bfloat16 --gpu-memory-utilization 0.90 \
   --port 8000 --api-key "$(cat "$AUTOQA_KEYFILE")"

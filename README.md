@@ -40,9 +40,10 @@ payloads on the same GPU:
 
 FP8 weights are *larger* than bnb (10.65 vs 8.92 GiB — FP8 keeps embeddings and
 `lm_head` in bf16) and CUDA graphs cost another 1.81 GiB, so the KV cache
-shrinks (3.57 vs 10.55 GiB) and max concurrency drops from ~35x to ~24x at 8k
-context. That is the trade: 4.4x throughput for a third less concurrency
-headroom. `--kv-cache-dtype fp8` halves KV bytes/token to claw some back.
+shrinks (3.57 vs 10.55 GiB). `--kv-cache-dtype fp8` halves KV bytes/token and
+buys most of that back — 429,904 cached tokens, ~61 concurrent requests at the
+~7k a real AutoQA call uses. So the trade is 4.4x throughput for very little
+concurrency headroom.
 
 The LoRA adapter is **not** folded into this step — it's applied separately by
 vLLM (`--enable-lora`), so `plain-gemma` and `autoqa-gemma` still come from one
@@ -91,7 +92,7 @@ vllm serve /opt/ml/models/autoqa-base-dense \
   --enable-lora --lora-modules autoqa-gemma=/opt/ml/adapters/standard --max-lora-rank 16 \
   --enable-auto-tool-choice --tool-call-parser functiongemma \
   --structured-outputs-config '{"backend": "xgrammar"}' \
-  --max-model-len 8192 --dtype bfloat16 --gpu-memory-utilization 0.90 \
+  --max-model-len 131072 --dtype bfloat16 --gpu-memory-utilization 0.90 \
   --port 8000 --api-key "$API_KEY"
 ```
 
@@ -183,7 +184,10 @@ under FP8 (the same test took ~12s under bitsandbytes).
 
 Both are on by default in vLLM 0.26 — nothing to configure:
 
-- **Paged KV cache** — 193,687 tokens under FP8, ~24x concurrency at 8k context.
+- **Paged KV cache** — 429,904 tokens under FP8 with `--kv-cache-dtype fp8`. At the
+  ~7k tokens a real AutoQA request actually uses, that is ~61 concurrent requests.
+  (vLLM's own startup line reports `3.28x` — that is the worst case where *every*
+  request fills the whole 131k window, not this workload.)
 - **Automatic prefix caching** (`enable_prefix_caching`) — reuses the shared
   system prompt and JSON schema across calls; a measured 42.4% hit rate on the
   AutoQA workload. Note it only saves *prefill*. Work that generates several KB
@@ -203,8 +207,8 @@ Both are on by default in vLLM 0.26 — nothing to configure:
 ## Known limitations
 
 - Single GPU, single vLLM process — no horizontal scaling built in.
-- KV cache is the binding constraint under FP8 on a 24GB card: 3.57 GiB, ~24x
-  concurrency at 8k context. Decode is memory-bandwidth-bound, so a card with
+- KV cache is the binding constraint under FP8 on a 24GB card: 3.57 GiB, ~61x
+  concurrency at the ~7k a real request uses. Decode is memory-bandwidth-bound, so a card with
   more bandwidth *and* more VRAM (L40S: 864 GB/s, 48 GB) would raise both
   throughput and concurrency; the L4 is ~300 GB/s.
 - The dequantized checkpoint is larger on disk (~16GB dense bf16, sharded) than
