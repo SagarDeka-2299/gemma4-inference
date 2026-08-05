@@ -55,6 +55,76 @@ building the whole ~16GB dense state dict in a single Python dict at once
 silently OOM-kills the process (no traceback); sharding keeps peak host RAM
 usage low regardless of total model size.
 
+## Hands-off deploy (no volume, no manual step)
+
+`deploy/autoqa_boot.sh` brings a bare GPU box to a serving state with nothing
+pre-staged. It is what the terraform user-data runs, and it is safe to re-run:
+
+```bash
+sudo bash deploy/autoqa_boot.sh          # keyless, all defaults
+sudo AUTOQA_API_KEY=sk-... bash deploy/autoqa_boot.sh   # with a bearer key
+```
+
+| what | where it comes from |
+|---|---|
+| base model | `unsloth/gemma-4-e4b-it`, pulled from HF by vLLM itself |
+| LoRA adapter | `s3://.../Autoqa/models/run1/best/`, read-only sync |
+| serving env | `vllm/vllm-openai:v0.26.0` image |
+| scratch | instance-store NVMe (`/opt/dlami/nvme`), falls back to root disk |
+| auth | `AUTOQA_API_KEY`; **empty means no auth at all** |
+
+Nothing persists between boots and nothing needs to. That replaces the previous
+setup, where the dequantized checkpoint, the adapter, the micromamba env and the
+API key all had to already exist on a pinned EBS volume -- the env alone took
+~25 min to build, which is *why* it had to be persisted.
+
+Keyless is the default because the endpoint sits behind a security group. Note
+that keyless plus a wide CIDR allowlist means anyone who can route to port 8000
+can spend the GPU; narrow the allowlist if you keep it keyless.
+
+### Two settings that came from failures, not preference
+
+**`--gpu-memory-utilization 0.80`, not 0.90.** The HF repo is the *multimodal*
+Gemma4 (`Gemma4ForConditionalGeneration`, vision + audio towers), not the
+text-only checkpoint the old path served. The towers cost only ~0.2 GiB of
+weights, but the model needs 172 CUDA graphs where the text-only one needed a
+handful. At 0.90 vLLM sized the KV cache to fill the budget (10.87 GiB weights +
+8.25 GiB KV) and then died capturing graphs: OOM asking for 128 MiB with 31 MiB
+free.
+
+**`--limit-mm-per-prompt '{"image": 0, "audio": 0}'`.** This workload is
+text-only, so reserving multimodal capacity and capturing encoder graphs is
+waste. Declaring zero returns that memory to the KV cache.
+
+Together they land *better* than the old volume-pinned setup, which was leaving
+VRAM unclaimed:
+
+| | volume-pinned, text-only base | this, multimodal base |
+|---|---|---|
+| weights | 10.65 GiB | 10.87 GiB |
+| KV cache | 3.57 GiB / 429,904 tok | **6.33 GiB / 762,516 tok** |
+| concurrency @131k | 3.28x | **5.82x** |
+| 8-concurrent throughput | 252.0 tok/s | 243.3 tok/s |
+
+The `torch.compile` cache is mounted out of the container. vLLM writes it to
+`/root/.cache/vllm`, which `--rm` discards; rebuilding costs ~130 s of Dynamo
+bytecode transform every start. Mounted, the cache reaches ~712 MB and
+`torch.compile` drops from 207 s to 132 s.
+
+### Why the LoRA still applies
+
+The adapter was QLoRA-trained against `unsloth/gemma-4-e4b-it-unsloth-bnb-4bit`,
+whose keys carry a `language_model` prefix
+(`base_model.model.model.language_model.layers.N...`). That maps onto the
+multimodal structure directly. vLLM warns `no matching PunicaWrapper ...
+audio_tower.* will be ignored` -- expected and harmless, since the adapter only
+ever targeted the text tower's `q,k,v,o,gate,up,down` projections.
+
+LoRA weights are stored bf16 and are never quantized; 4-bit only ever applied to
+the frozen base during training. Serving the base at FP8 is *closer* to the true
+bf16 weights than the 4-bit the adapter trained against, which is why the
+standard QLoRA deployment path is a higher-precision base.
+
 ## Setup
 
 Dequantize (one-time, run on the training/GPU box — needs a full 4-bit load of
